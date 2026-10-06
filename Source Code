@@ -1,0 +1,808 @@
+import AppKit
+import Network
+import CoreGraphics
+import UniformTypeIdentifiers
+import Darwin
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let blackout = BlackoutController()
+    private var osc: OSCServer?
+    private var statusItem: NSStatusItem!
+    private var controls: ControlsWindowController!
+
+    private let interfaceDefaultsKey = "oscInterface"
+    private let imagePathDefaultsKey = "overlayImagePath"
+    private var interfaces: [NetworkInterface] { NetworkInterface.available() }
+
+    private var port: UInt16 {
+        UInt16(UserDefaults.standard.integer(forKey: "oscPort"))
+    }
+
+    private var selectedInterfaceName: String {
+        get { UserDefaults.standard.string(forKey: interfaceDefaultsKey) ?? "any" }
+        set { UserDefaults.standard.set(newValue, forKey: interfaceDefaultsKey) }
+    }
+
+    private var selectedInterface: NetworkInterface? {
+        guard selectedInterfaceName != "any" else { return nil }
+        return interfaces.first { $0.name == selectedInterfaceName }
+    }
+
+    private var savedImageURL: URL? {
+        guard let path = UserDefaults.standard.string(forKey: imagePathDefaultsKey),
+              !path.isEmpty else { return nil }
+        return URL(fileURLWithPath: path)
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        if UserDefaults.standard.object(forKey: "oscPort") == nil {
+            UserDefaults.standard.set(58573, forKey: "oscPort")
+        }
+
+        if selectedInterfaceName != "any" && selectedInterface == nil {
+            selectedInterfaceName = "any"
+        }
+
+        // Restore the previously selected overlay image after app or computer restarts.
+        blackout.imageURL = savedImageURL
+
+        NSApp.setActivationPolicy(.accessory)
+        installStatusMenu()
+        controls = ControlsWindowController(
+            initialPort: port,
+            blackout: { [weak self] in self?.blackOut() },
+            black: { [weak self] in self?.blackDisplays() },
+            restore: { [weak self] in self?.restore() },
+            toggle: { [weak self] in self?.toggle() },
+            chooseImage: { [weak self] in self?.chooseImage() },
+            clearImage: { [weak self] in self?.clearImage() },
+            changePort: { [weak self] in self?.setPort($0) },
+            interfaces: interfaces,
+            initialInterface: selectedInterfaceName,
+            changeInterface: { [weak self] in self?.setInterface($0) }
+        )
+        controls.updateImagePath(blackout.imageURL?.path ?? "")
+        startOSC()
+
+        GlobalInputMonitor.shared.start { [weak self] in
+            guard let self, self.blackout.isActive, !self.blackout.ignoresInput else { return }
+            self.restore()
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        blackout.restore()
+        osc?.stop()
+        GlobalInputMonitor.shared.stop()
+    }
+
+    private func installStatusMenu() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem.button?.image = NSImage(systemSymbolName: "display", accessibilityDescription: "BlackoutOSC")
+
+        let menu = NSMenu()
+        menu.addItem(withTitle: "Settings", action: #selector(showControls), keyEquivalent: "")
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Overlay ON", action: #selector(blackOut), keyEquivalent: "")
+        menu.addItem(withTitle: "Overlay OFF", action: #selector(restore), keyEquivalent: "")
+        menu.addItem(.separator())
+        let portItem = menu.addItem(withTitle: "OSC UDP port \(port)", action: nil, keyEquivalent: "")
+        portItem.tag = 100
+        portItem.isEnabled = false
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Quit", action: #selector(quit), keyEquivalent: "q")
+        statusItem.menu = menu
+    }
+
+    private func startOSC() {
+        osc?.stop()
+        let server = OSCServer(port: port, bindAddress: selectedInterface?.address)
+
+        server.onCommand = { [weak self] command in
+            DispatchQueue.main.async {
+                self?.handle(command)
+            }
+        }
+
+        server.onStatus = { [weak self] status in
+            DispatchQueue.main.async {
+                guard let self else { return }
+
+                switch status {
+                case .listening(let port, let interfaceLabel):
+                    self.controls?.setOSCStatus(
+                        "OSC: LISTENING — \(interfaceLabel):\(port)"
+                    )
+
+                case .stopped:
+                    self.controls?.setOSCStatus("OSC: STOPPED")
+
+                case .error(let message):
+                    self.controls?.setOSCStatus(
+                        "OSC: ERROR — \(message)",
+                        isError: true
+                    )
+                }
+            }
+        }
+
+        server.start()
+        osc = server
+    }
+
+    private func setPort(_ newPort: UInt16) {
+        guard newPort != port else { return }
+        UserDefaults.standard.set(Int(newPort), forKey: "oscPort")
+        startOSC()
+        statusItem.menu?.item(withTag: 100)?.title = "OSC UDP port \(newPort)"
+        controls.setListeningPort(newPort)
+    }
+
+    private func setInterface(_ name: String) {
+        guard name != selectedInterfaceName else { return }
+        selectedInterfaceName = name
+        startOSC()
+        controls.setListeningInterface(name)
+    }
+
+    private func handle(_ command: OSCCommand) {
+        switch command.address.lowercased() {
+        case "/blackoutosc/start":
+            if let path = command.firstString {
+                setImage(URL(fileURLWithPath: path))
+                controls.updateImagePath(path)
+            }
+            blackOut()
+        case "/blackoutosc/stop":
+            restore()
+        case "/blackoutosc/black":
+            blackDisplays()
+        case "/blackoutosc/toggle":
+            toggle()
+        case "/blackoutosc/setimage":
+            guard let path = command.firstString else { return }
+            setImage(URL(fileURLWithPath: path))
+            controls.updateImagePath(path)
+            if blackout.isActive { blackout.show() }
+        default:
+            NSLog("Ignored OSC command: \(command.address)")
+        }
+    }
+
+    @objc private func showControls() {
+        controls.showWindow(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func blackOut() {
+        blackout.show()
+        controls.setBlackoutActive(true)
+        statusItem.button?.image = NSImage(systemSymbolName: "display.trianglebadge.exclamationmark", accessibilityDescription: "Blackout active")
+    }
+
+    private func blackDisplays() {
+        blackout.showBlack()
+        controls.setBlackoutActive(true)
+        statusItem.button?.image = NSImage(systemSymbolName: "display.trianglebadge.exclamationmark", accessibilityDescription: "Blackout active")
+    }
+
+    @objc private func restore() {
+        blackout.restore()
+        controls.setBlackoutActive(false)
+        statusItem.button?.image = NSImage(systemSymbolName: "display", accessibilityDescription: "Blackout inactive")
+    }
+
+    @objc private func toggle() { blackout.isActive ? restore() : blackOut() }
+    @objc private func quit() { NSApp.terminate(nil) }
+
+    private func clearImage() {
+        blackout.imageURL = nil
+        UserDefaults.standard.removeObject(forKey: imagePathDefaultsKey)
+        controls.updateImagePath("")
+        if blackout.isActive { blackout.show() }
+    }
+
+    private func setImage(_ url: URL) {
+        blackout.imageURL = url
+        UserDefaults.standard.set(url.path, forKey: imagePathDefaultsKey)
+    }
+
+    private func chooseImage() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            self?.setImage(url)
+            self?.controls.updateImagePath(url.path)
+            if self?.blackout.isActive == true { self?.blackout.show() }
+        }
+    }
+}
+
+private final class BlackoutController {
+    private var panels: [NSPanel] = []
+    private var blackOnly = false
+    var imageURL: URL?
+    var ignoresInput = false
+    var isActive: Bool { !panels.isEmpty }
+
+    init() {
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(screensChanged),
+            name: NSApplication.didChangeScreenParametersNotification, object: nil
+        )
+    }
+
+    deinit { NotificationCenter.default.removeObserver(self) }
+
+    func show() {
+        blackOnly = false
+        present(image: imageURL.flatMap(NSImage.init(contentsOf:)))
+    }
+
+    func showBlack() {
+        blackOnly = true
+        present(image: nil)
+    }
+
+    private func present(image: NSImage?) {
+        restore()
+
+        for screen in NSScreen.screens {
+            let panel = NSPanel(
+                contentRect: screen.frame,
+                styleMask: [.borderless, .nonactivatingPanel],
+                backing: .buffered,
+                defer: false,
+                screen: screen
+            )
+            panel.isOpaque = true
+            panel.backgroundColor = .black
+            panel.hasShadow = false
+            panel.level = .screenSaver
+            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+            panel.hidesOnDeactivate = false
+            panel.ignoresMouseEvents = true
+            panel.contentView = OverlayView(image: image)
+            panel.setFrame(screen.frame, display: true)
+            panel.orderFrontRegardless()
+            panels.append(panel)
+        }
+    }
+
+    func restore() {
+        panels.forEach { panel in
+            panel.orderOut(nil)
+            panel.close()
+        }
+        panels.removeAll()
+    }
+
+    @objc private func screensChanged() {
+        if isActive {
+            blackOnly ? showBlack() : show()
+        }
+    }
+}
+
+private final class OverlayView: NSView {
+    private let image: NSImage?
+
+    init(image: NSImage?) {
+        self.image = image
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.black.cgColor
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.black.setFill()
+        bounds.fill()
+        guard let image else { return }
+
+        let source = image.size
+        guard source.width > 0, source.height > 0 else { return }
+        let scale = min(bounds.width / source.width, bounds.height / source.height)
+        let size = NSSize(width: source.width * scale, height: source.height * scale)
+        let rect = NSRect(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2,
+                          width: size.width, height: size.height)
+        image.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1)
+    }
+}
+
+private final class ControlsWindowController: NSWindowController {
+    private let imagePath = NSTextField(string: "")
+    private let stateLabel = NSTextField(labelWithString: "Displays are visible")
+    private let portField = NSTextField(string: "58573")
+    private let portStatus = NSTextField(labelWithString: "")
+    private let interfacePopup = NSPopUpButton()
+    private let interfaceStatus = NSTextField(labelWithString: "")
+    private let oscStatus = NSTextField(labelWithString: "OSC: Starting…")
+    private let onBlackout: () -> Void
+    private let onBlack: () -> Void
+    private let onRestore: () -> Void
+    private let onToggle: () -> Void
+    private let onChooseImage: () -> Void
+    private let onClearImage: () -> Void
+    private let onChangePort: (UInt16) -> Void
+    private let onChangeInterface: (String) -> Void
+
+    init(initialPort: UInt16, blackout: @escaping () -> Void, black: @escaping () -> Void,
+         restore: @escaping () -> Void, toggle: @escaping () -> Void,
+         chooseImage: @escaping () -> Void, clearImage: @escaping () -> Void,
+         changePort: @escaping (UInt16) -> Void, interfaces: [NetworkInterface],
+         initialInterface: String, changeInterface: @escaping (String) -> Void) {
+        onBlackout = blackout
+        onBlack = black
+        onRestore = restore
+        onToggle = toggle
+        onChooseImage = chooseImage
+        onClearImage = clearImage
+        onChangePort = changePort
+        onChangeInterface = changeInterface
+
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 650, height: 660),
+                              styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+        window.title = "BlackoutOSC"
+        window.isReleasedWhenClosed = false
+        window.center()
+        super.init(window: window)
+
+        portField.stringValue = String(initialPort)
+        interfacePopup.removeAllItems()
+        interfacePopup.addItem(withTitle: "All interfaces (0.0.0.0)")
+        interfacePopup.lastItem?.representedObject = "any"
+        for networkInterface in interfaces {
+            interfacePopup.addItem(withTitle: networkInterface.label)
+            interfacePopup.lastItem?.representedObject = networkInterface.name
+        }
+        selectInterface(initialInterface)
+
+        buildUI()
+        setListeningPort(initialPort)
+        setListeningInterface(initialInterface)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    private func buildUI() {
+        guard let content = window?.contentView else { return }
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 14
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 24),
+            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -24),
+            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 22)
+        ])
+
+        let title = NSTextField(labelWithString: "BlackoutOSC")
+        title.font = .systemFont(ofSize: 23, weight: .bold)
+        stack.addArrangedSubview(title)
+
+        let intro = NSTextField(wrappingLabelWithString: "BlackoutOSC is an OSC-controlled utility, which allows operators to instantly cover screens with custom images when away from Front of House. Use it to display branding, holding graphics, or other visuals while keeping the underlying interface hidden.")
+        intro.textColor = .secondaryLabelColor
+        intro.maximumNumberOfLines = 12
+        stack.addArrangedSubview(intro)
+
+        let imageRow = NSStackView()
+        imageRow.orientation = .horizontal
+        imageRow.spacing = 8
+        let imageLabel = NSTextField(labelWithString: "Overlay image:")
+        imagePath.isEditable = false
+        imagePath.isSelectable = true
+        imagePath.placeholderString = "No image selected (black only)"
+        imagePath.widthAnchor.constraint(equalToConstant: 350).isActive = true
+        imageRow.addArrangedSubview(imageLabel)
+        imageRow.addArrangedSubview(imagePath)
+        imageRow.addArrangedSubview(button("Choose…", #selector(chooseImage)))
+        imageRow.addArrangedSubview(button("Clear", #selector(clearImage)))
+        stack.addArrangedSubview(imageRow)
+
+        let portRow = NSStackView()
+        portRow.orientation = .horizontal
+        portRow.spacing = 8
+        portRow.addArrangedSubview(NSTextField(labelWithString: "OSC UDP port:"))
+        portField.widthAnchor.constraint(equalToConstant: 90).isActive = true
+        portRow.addArrangedSubview(portField)
+        portRow.addArrangedSubview(button("Apply Port", #selector(applyPort)))
+        portStatus.textColor = .secondaryLabelColor
+        portRow.addArrangedSubview(portStatus)
+        stack.addArrangedSubview(portRow)
+
+        let interfaceRow = NSStackView()
+        interfaceRow.orientation = .horizontal
+        interfaceRow.spacing = 8
+        interfaceRow.addArrangedSubview(NSTextField(labelWithString: "Listen on interface:"))
+        interfacePopup.target = self
+        interfacePopup.action = #selector(interfaceChanged)
+        interfacePopup.widthAnchor.constraint(equalToConstant: 250).isActive = true
+        interfaceRow.addArrangedSubview(interfacePopup)
+        interfaceStatus.textColor = .secondaryLabelColor
+        interfaceRow.addArrangedSubview(interfaceStatus)
+        stack.addArrangedSubview(interfaceRow)
+
+        let actionRow = NSStackView()
+        actionRow.orientation = .horizontal
+        actionRow.spacing = 10
+        actionRow.addArrangedSubview(button("Test Overlay", #selector(blackout)))
+        actionRow.addArrangedSubview(button("Black", #selector(black)))
+        actionRow.addArrangedSubview(button("Restore Displays", #selector(restore)))
+        stack.addArrangedSubview(actionRow)
+
+        oscStatus.font = .systemFont(ofSize: 12, weight: .semibold)
+        oscStatus.textColor = .secondaryLabelColor
+        stack.addArrangedSubview(oscStatus)
+
+        stateLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        stack.addArrangedSubview(stateLabel)
+
+        let oscTitle = NSTextField(labelWithString: "OSC commands")
+        oscTitle.font = .systemFont(ofSize: 16, weight: .bold)
+        stack.addArrangedSubview(oscTitle)
+
+        let commands = NSTextField(wrappingLabelWithString: "/blackoutosc/start — Screen overlays ON \n/blackoutosc/black — Black out displays, ignoring the overlay image\n/blackoutosc/stop — Screen overlays OFF\n/blackoutosc/setimage \"/path/to/image.png\" — set the image")
+        commands.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        commands.textColor = .secondaryLabelColor
+        stack.addArrangedSubview(commands)
+
+        let footer = NSTextField(labelWithString: "copyright (c) 2026. Kyle Jensen Sound Design. All Rights Reserved")
+        footer.font = .systemFont(ofSize: 8)
+        footer.textColor = .tertiaryLabelColor
+        footer.alignment = .center
+        footer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        stack.addArrangedSubview(footer)
+    }
+
+    private func button(_ title: String, _ action: Selector) -> NSButton {
+        let button = NSButton(title: title, target: self, action: action)
+        button.bezelStyle = .rounded
+        return button
+    }
+
+    func updateImagePath(_ path: String) { imagePath.stringValue = path }
+
+    func setListeningPort(_ port: UInt16) {
+        portField.stringValue = String(port)
+        portStatus.stringValue = "Listening on UDP \(port)"
+    }
+
+    func setListeningInterface(_ name: String) {
+        selectInterface(name)
+        if name == "any" {
+            interfaceStatus.stringValue = "All IPv4 interfaces"
+        } else if let item = interfacePopup.selectedItem {
+            interfaceStatus.stringValue = item.title
+        }
+    }
+
+    private func selectInterface(_ name: String) {
+        if let index = interfacePopup.itemArray.firstIndex(where: {
+            ($0.representedObject as? String) == name
+        }) {
+            interfacePopup.selectItem(at: index)
+        } else {
+            interfacePopup.selectItem(at: 0)
+        }
+    }
+
+    func setBlackoutActive(_ active: Bool) {
+        stateLabel.stringValue = active ? "All connected displays are blacked out" : "Displays are visible"
+        stateLabel.textColor = active ? .systemRed : .secondaryLabelColor
+    }
+
+    func setOSCStatus(_ text: String, isError: Bool = false) {
+        oscStatus.stringValue = text
+        oscStatus.textColor = isError ? .systemRed : .secondaryLabelColor
+    }
+
+    @objc private func chooseImage() { onChooseImage() }
+    @objc private func clearImage() { onClearImage() }
+    @objc private func blackout() { onBlackout() }
+    @objc private func black() { onBlack() }
+    @objc private func restore() { onRestore() }
+    @objc private func toggle() { onToggle() }
+
+    @objc private func applyPort() {
+        guard let value = UInt16(portField.stringValue), value > 0 else {
+            portStatus.stringValue = "Enter a port from 1 to 65535"
+            return
+        }
+        onChangePort(value)
+    }
+
+    @objc private func interfaceChanged() {
+        let name = interfacePopup.selectedItem?.representedObject as? String ?? "any"
+        onChangeInterface(name)
+    }
+}
+
+private struct NetworkInterface {
+    let name: String
+    let address: String
+    let label: String
+
+    static func available() -> [NetworkInterface] {
+        var result: [NetworkInterface] = []
+        var first: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&first) == 0 else { return result }
+        defer { freeifaddrs(first) }
+
+        var current = first
+        while let entry = current?.pointee {
+            defer { current = entry.ifa_next }
+            guard let address = entry.ifa_addr,
+                  address.pointee.sa_family == UInt8(AF_INET),
+                  (entry.ifa_flags & UInt32(IFF_UP)) != 0,
+                  (entry.ifa_flags & UInt32(IFF_RUNNING)) != 0 else { continue }
+
+            let name = String(cString: entry.ifa_name)
+            var ipv4 = address.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+                $0.pointee.sin_addr
+            }
+            var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+            guard inet_ntop(AF_INET, &ipv4, &buffer, socklen_t(INET_ADDRSTRLEN)) != nil else {
+                continue
+            }
+
+            let ip = String(cString: buffer)
+            guard !result.contains(where: { $0.name == name }) else { continue }
+            result.append(NetworkInterface(name: name, address: ip, label: "\(name) — \(ip)"))
+        }
+
+        return result.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+}
+
+private struct OSCCommand {
+    let address: String
+    let firstString: String?
+}
+
+private final class OSCServer {
+    private let port: UInt16
+    private let bindAddress: String?
+    private let receiveQueue = DispatchQueue(
+        label: "BlackoutOSC.UDP.receive",
+        qos: .userInitiated
+    )
+
+    private let stateLock = NSLock()
+    private var socket: Int32 = -1
+    private var running = false
+    private var generation = 0
+
+    var onCommand: ((OSCCommand) -> Void)?
+    var onStatus: ((OSCServerStatus) -> Void)?
+
+    enum OSCServerStatus {
+        case listening(UInt16, String)
+        case stopped
+        case error(String)
+    }
+
+    init(port: UInt16, bindAddress: String? = nil) {
+        self.port = port
+        self.bindAddress = bindAddress
+    }
+
+    func start() {
+        stop()
+
+        let fd = Darwin.socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard fd >= 0 else {
+            let message = "Could not create UDP socket: \(String(cString: strerror(errno)))"
+            NSLog("BlackoutOSC: \(message)")
+            onStatus?(.error(message))
+            return
+        }
+
+        var reuse: Int32 = 1
+        _ = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse,
+                       socklen_t(MemoryLayout<Int32>.size))
+
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = port.bigEndian
+
+        if let bindAddress {
+            var selectedAddress = in_addr()
+            let conversionResult = bindAddress.withCString {
+                inet_pton(AF_INET, $0, &selectedAddress)
+            }
+            guard conversionResult == 1 else {
+                let message = "Invalid IPv4 interface address: \(bindAddress)"
+                Darwin.close(fd)
+                onStatus?(.error(message))
+                return
+            }
+            address.sin_addr = selectedAddress
+        } else {
+            address.sin_addr = in_addr(s_addr: INADDR_ANY)
+        }
+
+        let bindResult = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+
+        guard bindResult == 0 else {
+            let message = "Could not bind UDP port \(port): \(String(cString: strerror(errno)))"
+            NSLog("BlackoutOSC: \(message)")
+            Darwin.close(fd)
+            onStatus?(.error(message))
+            return
+        }
+
+        stateLock.lock()
+        generation += 1
+        let token = generation
+        socket = fd
+        running = true
+        stateLock.unlock()
+
+        let interfaceLabel = bindAddress ?? "0.0.0.0"
+        NSLog("BlackoutOSC: OSC listening on IPv4 UDP \(interfaceLabel):\(port)")
+        onStatus?(.listening(port, interfaceLabel))
+
+        receiveQueue.async { [weak self] in
+            self?.receiveLoop(socket: fd, token: token)
+        }
+    }
+
+    func stop() {
+        stateLock.lock()
+        generation += 1
+        running = false
+        let fd = socket
+        socket = -1
+        stateLock.unlock()
+
+        if fd >= 0 {
+            Darwin.shutdown(fd, SHUT_RDWR)
+            Darwin.close(fd)
+        }
+
+        onStatus?(.stopped)
+    }
+
+    private func isRunning(token: Int) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return running && generation == token
+    }
+
+    private func receiveLoop(socket: Int32, token: Int) {
+        var buffer = [UInt8](repeating: 0, count: 65_535)
+
+        while isRunning(token: token) {
+            var sender = sockaddr_storage()
+            var senderLength = socklen_t(MemoryLayout<sockaddr_storage>.size)
+
+            let count = buffer.withUnsafeMutableBytes { bytes in
+                withUnsafeMutablePointer(to: &sender) { senderPtr in
+                    senderPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                        Darwin.recvfrom(socket, bytes.baseAddress, bytes.count, 0, $0, &senderLength)
+                    }
+                }
+            }
+
+            if count > 0 {
+                let data = Data(buffer[0..<Int(count)])
+                NSLog("BlackoutOSC: Received UDP packet (%d bytes)", Int(count))
+                let commands = Self.parseMessages(data)
+
+                if commands.isEmpty {
+                    NSLog("BlackoutOSC: Packet received but could not parse as OSC")
+                }
+
+                for command in commands {
+                    NSLog("BlackoutOSC: OSC address = %@", command.address)
+                    if let argument = command.firstString {
+                        NSLog("BlackoutOSC: OSC string argument = %@", argument)
+                    }
+                    onCommand?(command)
+                }
+            } else if count < 0 {
+                let error = errno
+                if error != EBADF && error != EINTR && error != ECONNRESET && isRunning(token: token) {
+                    NSLog("BlackoutOSC: recvfrom error: %s", strerror(error))
+                }
+            }
+        }
+
+        NSLog("BlackoutOSC: UDP receive loop stopped")
+    }
+
+    private static func parseMessages(_ data: Data) -> [OSCCommand] {
+        guard !data.isEmpty else { return [] }
+        if string(at: 0, in: data) == "#bundle" { return parseBundle(data) }
+        if let message = parseMessage(data) { return [message] }
+        return []
+    }
+
+    private static func parseBundle(_ data: Data) -> [OSCCommand] {
+        guard data.count >= 16 else { return [] }
+        var offset = 16
+        var commands: [OSCCommand] = []
+
+        while offset + 4 <= data.count {
+            let length = data[offset..<(offset + 4)].reduce(UInt32(0)) {
+                ($0 << 8) | UInt32($1)
+            }
+            offset += 4
+            let end = offset + Int(length)
+            guard length > 0, end <= data.count else { break }
+            commands += parseMessages(data.subdata(in: offset..<end))
+            offset = end
+        }
+        return commands
+    }
+
+    private static func parseMessage(_ data: Data) -> OSCCommand? {
+        guard let address = string(at: 0, in: data), address.hasPrefix("/") else { return nil }
+        let typeOffset = paddedLength(at: 0, in: data)
+        guard typeOffset < data.count else {
+            return OSCCommand(address: address, firstString: nil)
+        }
+        guard let tags = string(at: typeOffset, in: data) else {
+            return OSCCommand(address: address, firstString: nil)
+        }
+        if tags.hasPrefix(",s") {
+            let argumentOffset = typeOffset + paddedLength(at: typeOffset, in: data)
+            return OSCCommand(address: address, firstString: string(at: argumentOffset, in: data))
+        }
+        return OSCCommand(address: address, firstString: nil)
+    }
+
+    private static func string(at offset: Int, in data: Data) -> String? {
+        guard offset < data.count else { return nil }
+        let bytes = data[offset...]
+        guard let end = bytes.firstIndex(of: 0) else { return nil }
+        return String(data: data[offset..<end], encoding: .utf8)
+    }
+
+    private static func paddedLength(at offset: Int, in data: Data) -> Int {
+        guard offset < data.count else { return 0 }
+        let count = data[offset...].prefix { $0 != 0 }.count + 1
+        return ((count + 3) / 4) * 4
+    }
+}
+
+private final class GlobalInputMonitor {
+    static let shared = GlobalInputMonitor()
+    private var monitor: Any?
+
+    func start(onInput: @escaping () -> Void) {
+        stop()
+        monitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown]
+        ) { _ in
+            onInput()
+        }
+    }
+
+    func stop() {
+        if let monitor { NSEvent.removeMonitor(monitor) }
+        monitor = nil
+    }
+}
+
+@main
+struct BlackoutOSCMain {
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.run()
+    }
+}
