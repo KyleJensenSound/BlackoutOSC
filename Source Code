@@ -5,11 +5,34 @@ import UniformTypeIdentifiers
 import AVFoundation
 import Darwin
 
+private func colorFromHex(_ hex: String) -> NSColor? {
+    let value = hex.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard value.count == 7, value.first == "#",
+          let rgb = UInt32(value.dropFirst(), radix: 16) else { return nil }
+    return NSColor(
+        red: CGFloat((rgb >> 16) & 0xFF) / 255,
+        green: CGFloat((rgb >> 8) & 0xFF) / 255,
+        blue: CGFloat(rgb & 0xFF) / 255,
+        alpha: 1
+    )
+}
+
+private func hexFromColor(_ color: NSColor) -> String {
+    let rgb = color.usingColorSpace(.deviceRGB) ?? .black
+    return String(
+        format: "#%02X%02X%02X",
+        Int((rgb.redComponent * 255).rounded()),
+        Int((rgb.greenComponent * 255).rounded()),
+        Int((rgb.blueComponent * 255).rounded())
+    )
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let blackout = BlackoutController()
     private var osc: OSCServer?
     private var statusItem: NSStatusItem!
     private var controls: ControlsWindowController!
+    private var selectedOverlayColor = NSColor.black
 
     private let interfaceDefaultsKey = "oscInterface"
     private let mediaPathDefaultsKey = "overlayMediaPath"
@@ -17,38 +40,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let muteVideoDefaultsKey = "muteVideo"
     private var interfaces: [NetworkInterface] { NetworkInterface.available() }
 
-    private var port: UInt16 { UInt16(UserDefaults.standard.integer(forKey: "oscPort")) }
+    private var port: UInt16 {
+        let value = UserDefaults.standard.integer(forKey: "oscPort")
+        return UInt16(clamping: value == 0 ? 58573 : value)
+    }
+
     private var selectedInterfaceName: String {
         get { UserDefaults.standard.string(forKey: interfaceDefaultsKey) ?? "any" }
         set { UserDefaults.standard.set(newValue, forKey: interfaceDefaultsKey) }
     }
+
     private var selectedInterface: NetworkInterface? {
         guard selectedInterfaceName != "any" else { return nil }
         return interfaces.first { $0.name == selectedInterfaceName }
     }
+
     private var savedMediaURL: URL? {
         guard let path = UserDefaults.standard.string(forKey: mediaPathDefaultsKey), !path.isEmpty else { return nil }
         return URL(fileURLWithPath: path)
     }
+
     private var loopVideo: Bool {
         get { UserDefaults.standard.bool(forKey: loopVideoDefaultsKey) }
         set { UserDefaults.standard.set(newValue, forKey: loopVideoDefaultsKey) }
     }
+
     private var muteVideo: Bool {
         get { UserDefaults.standard.bool(forKey: muteVideoDefaultsKey) }
         set { UserDefaults.standard.set(newValue, forKey: muteVideoDefaultsKey) }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        if UserDefaults.standard.object(forKey: "oscPort") == nil { UserDefaults.standard.set(58573, forKey: "oscPort") }
-        if selectedInterfaceName != "any" && selectedInterface == nil { selectedInterfaceName = "any" }
+        if UserDefaults.standard.object(forKey: "oscPort") == nil {
+            UserDefaults.standard.set(58573, forKey: "oscPort")
+        }
+
+        if selectedInterfaceName != "any" && selectedInterface == nil {
+            selectedInterfaceName = "any"
+        }
+
         blackout.mediaURL = savedMediaURL
         blackout.loopVideo = loopVideo
         blackout.muteVideo = muteVideo
+        selectedOverlayColor = colorFromHex(
+            UserDefaults.standard.string(forKey: "overlayColorHex") ?? "#000000"
+        ) ?? .black
 
         NSApp.setActivationPolicy(.accessory)
         installMainMenu()
         installStatusMenu()
+
         controls = ControlsWindowController(
             initialPort: port,
             blackout: { [weak self] in self?.blackOut() },
@@ -64,8 +105,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             changePort: { [weak self] in self?.setPort($0) },
             interfaces: interfaces,
             initialInterface: selectedInterfaceName,
-            changeInterface: { [weak self] in self?.setInterface($0) }
+            changeInterface: { [weak self] in self?.setInterface($0) },
+            initialColor: selectedOverlayColor,
+            changeColor: { [weak self] in self?.setCustomColor($0) },
+            applyColor: { [weak self] in self?.applySelectedColor() }
         )
+
         controls.updateMediaPath(blackout.mediaURL?.path ?? "")
         startOSC()
 
@@ -98,15 +143,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func installStatusMenu() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.image = NSImage(systemSymbolName: "display", accessibilityDescription: "BlackoutOSC")
+
         let menu = NSMenu()
         menu.addItem(withTitle: "Settings", action: #selector(showControls), keyEquivalent: "")
         menu.addItem(.separator())
         menu.addItem(withTitle: "Overlay ON", action: #selector(blackOut), keyEquivalent: "")
         menu.addItem(withTitle: "Overlay OFF", action: #selector(restore), keyEquivalent: "")
         menu.addItem(.separator())
+
         let portItem = menu.addItem(withTitle: "OSC UDP port \(port)", action: nil, keyEquivalent: "")
         portItem.tag = 100
         portItem.isEnabled = false
+
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quit", action: #selector(quit), keyEquivalent: "q")
         statusItem.menu = menu
@@ -114,26 +162,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func startOSC() {
         osc?.stop()
+
         let server = OSCServer(port: port, bindAddress: selectedInterface?.address)
-        server.onCommand = { [weak self] command in
-            DispatchQueue.main.async { self?.handle(command) }
-        }
-        server.onStatus = { [weak self] status in
+        server.onCommand = { [weak self, weak server] command in
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, self.osc === server else { return }
+                self.handle(command)
+            }
+        }
+
+        server.onStatus = { [weak self, weak server] status in
+            DispatchQueue.main.async {
+                guard let self, self.osc === server else { return }
+
                 switch status {
-                case .listening(let port, let interfaceLabel): self.controls?.setOSCStatus("OSC: LISTENING — \(interfaceLabel):\(port)")
-                case .stopped: self.controls?.setOSCStatus("OSC: STOPPED")
-                case .error(let message): self.controls?.setOSCStatus("OSC: ERROR — \(message)", isError: true)
+                case .listening(let port, let interfaceLabel):
+                    self.controls?.setOSCStatus("OSC: LISTENING — \(interfaceLabel):\(port)")
+                case .stopped:
+                    self.controls?.setOSCStatus("OSC: STOPPED")
+                case .error(let message):
+                    self.controls?.setOSCStatus("OSC: ERROR — \(message)", isError: true)
                 }
             }
         }
-        server.start()
+
         osc = server
+        server.start()
     }
 
     private func setPort(_ newPort: UInt16) {
-        guard newPort != port else { return }
+        guard newPort > 0, newPort != port else { return }
+
         UserDefaults.standard.set(Int(newPort), forKey: "oscPort")
         startOSC()
         statusItem.menu?.item(withTag: 100)?.title = "OSC UDP port \(newPort)"
@@ -151,26 +210,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch command.address.lowercased() {
         case "/blackoutosc/start":
             if let path = command.firstString {
-                setMedia(URL(fileURLWithPath: path))
-                controls.updateMediaPath(path)
+                _ = setMediaIfValid(URL(fileURLWithPath: path))
             }
             blackOut()
-        case "/blackoutosc/stop": restore()
-        case "/blackoutosc/black": blackDisplays()
-        case "/blackoutosc/toggle": toggle()
+
+        case "/blackoutosc/stop":
+            restore()
+
+        case "/blackoutosc/black":
+            blackDisplays()
+
+        case "/blackoutosc/toggle":
+            toggle()
+
         case "/blackoutosc/setmedia":
-            guard let path = command.firstString else { return }
-            setMedia(URL(fileURLWithPath: path))
-            controls.updateMediaPath(path)
+            guard let path = command.firstString,
+                  setMediaIfValid(URL(fileURLWithPath: path)) else { return }
             if blackout.isActive { blackout.show() }
+
         case "/blackoutosc/videoloop":
             guard let value = command.firstString, value == "0" || value == "1" else { return }
             setLoopVideo(value == "1")
+
         case "/blackoutosc/videomute", "/blackoutosc/mute":
             guard let value = command.firstString, value == "0" || value == "1" else { return }
             setMuteVideo(value == "1")
+
+        case "/blackoutosc/color":
+            guard let value = command.firstString,
+                  let color = colorFromHex(value) else {
+                NSLog("BlackoutOSC: invalid color; expected #RRGGBB")
+                return
+            }
+            setCustomColor(color)
+            applySelectedColor()
+
         default:
-            NSLog("Ignored OSC command: \(command.address)")
+            NSLog("Ignored OSC command: %@", command.address)
         }
     }
 
@@ -179,23 +255,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         controls.window?.makeKeyAndOrderFront(nil)
     }
+
     @objc private func blackOut() {
         blackout.show()
         controls.setBlackoutActive(true)
         statusItem.button?.image = NSImage(systemSymbolName: "display.trianglebadge.exclamationmark", accessibilityDescription: "Blackout active")
     }
+
     private func blackDisplays() {
         blackout.showBlack()
         controls.setBlackoutActive(true)
         statusItem.button?.image = NSImage(systemSymbolName: "display.trianglebadge.exclamationmark", accessibilityDescription: "Blackout active")
     }
+
     @objc private func restore() {
         blackout.restore()
         controls.setBlackoutActive(false)
         statusItem.button?.image = NSImage(systemSymbolName: "display", accessibilityDescription: "Blackout inactive")
     }
-    @objc private func toggle() { blackout.isActive ? restore() : blackOut() }
-    @objc private func quit() { NSApp.terminate(nil) }
+
+    @objc private func toggle() {
+        blackout.isActive ? restore() : blackOut()
+    }
+
+    @objc private func quit() {
+        NSApp.terminate(nil)
+    }
 
     private func clearMedia() {
         blackout.mediaURL = nil
@@ -203,32 +288,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controls.updateMediaPath("")
         if blackout.isActive { blackout.show() }
     }
+
     private func setMedia(_ url: URL) {
         blackout.mediaURL = url
         UserDefaults.standard.set(url.path, forKey: mediaPathDefaultsKey)
         controls.updateMediaPath(url.path)
     }
+
+    @discardableResult
+    private func setMediaIfValid(_ url: URL) -> Bool {
+        let type = UTType(filenameExtension: url.pathExtension)
+        let isSupported = type?.conforms(to: .image) == true || type?.conforms(to: .movie) == true
+
+        guard url.isFileURL,
+              FileManager.default.isReadableFile(atPath: url.path),
+              isSupported else {
+            NSLog("BlackoutOSC: rejected unavailable or unsupported media: %@", url.path)
+            return false
+        }
+
+        setMedia(url)
+        return true
+    }
+
     private func setLoopVideo(_ enabled: Bool) {
         loopVideo = enabled
         blackout.loopVideo = enabled
         controls.setLoopVideo(enabled)
         if blackout.isActive { blackout.show() }
     }
+
     private func setMuteVideo(_ enabled: Bool) {
         muteVideo = enabled
         blackout.muteVideo = enabled
         controls.setMuteVideo(enabled)
         if blackout.isActive { blackout.show() }
     }
+
+    private func setCustomColor(_ color: NSColor) {
+        selectedOverlayColor = color.usingColorSpace(.deviceRGB) ?? .black
+        UserDefaults.standard.set(hexFromColor(selectedOverlayColor), forKey: "overlayColorHex")
+        controls?.setSelectedColor(selectedOverlayColor)
+    }
+
+    private func applySelectedColor() {
+        blackout.showColor(selectedOverlayColor)
+        controls.setBlackoutActive(true)
+        statusItem.button?.image = NSImage(
+            systemSymbolName: "display.trianglebadge.exclamationmark",
+            accessibilityDescription: "Color overlay active"
+        )
+    }
+
     private func chooseMedia() {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.image, .movie]
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
+
         panel.begin { [weak self] response in
-            guard response == .OK, let url = panel.url else { return }
-            self?.setMedia(url)
-            if self?.blackout.isActive == true { self?.blackout.show() }
+            guard response == .OK,
+                  let url = panel.url,
+                  let self,
+                  self.setMediaIfValid(url) else { return }
+
+            if self.blackout.isActive { self.blackout.show() }
         }
     }
 }
@@ -236,6 +360,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 private final class BlackoutController {
     private var panels: [NSPanel] = []
     private var blackOnly = false
+    private var colorOnly = false
+    private var activeColor = NSColor.black
+
     var mediaURL: URL?
     var loopVideo = false
     var muteVideo = false
@@ -243,48 +370,104 @@ private final class BlackoutController {
     var isActive: Bool { !panels.isEmpty }
 
     init() {
-        NotificationCenter.default.addObserver(self, selector: #selector(screensChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(screensChanged),
+            name: NSApplication.didChangeScreenParametersNotification,
+            object: nil
+        )
     }
-    deinit { NotificationCenter.default.removeObserver(self) }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
 
     func show() {
         blackOnly = false
-        let image = mediaURL.flatMap { isVideo($0) ? nil : NSImage(contentsOf: $0) }
+        colorOnly = false
+
+        let image: NSImage?
+        if let url = mediaURL,
+           !isVideo(url),
+           FileManager.default.isReadableFile(atPath: url.path) {
+            image = NSImage(contentsOf: url)
+        } else {
+            image = nil
+        }
+
         present(mediaURL: mediaURL, image: image)
     }
+
     func showBlack() {
         blackOnly = true
+        colorOnly = false
         present(mediaURL: nil, image: nil)
     }
-    private func present(mediaURL: URL?, image: NSImage?) {
+
+    func showColor(_ color: NSColor) {
+        blackOnly = false
+        colorOnly = true
+        activeColor = color.usingColorSpace(.deviceRGB) ?? .black
+        present(mediaURL: nil, image: nil, backgroundColor: activeColor)
+    }
+
+    private func present(mediaURL: URL?, image: NSImage?, backgroundColor: NSColor = .black) {
         restore()
-        for screen in NSScreen.screens {
-            let panel = NSPanel(contentRect: screen.frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false, screen: screen)
+
+        for screen in NSScreen.screens where screen.frame.width > 0 && screen.frame.height > 0 {
+            let panel = NSPanel(
+                contentRect: screen.frame,
+                styleMask: [.borderless, .nonactivatingPanel],
+                backing: .buffered,
+                defer: false,
+                screen: screen
+            )
+
             panel.isOpaque = true
-            panel.backgroundColor = .black
+            panel.backgroundColor = backgroundColor
             panel.hasShadow = false
             panel.level = .screenSaver
             panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
             panel.hidesOnDeactivate = false
             panel.ignoresMouseEvents = true
+
+            let videoURL: URL?
+
+            if let mediaURL, isVideo(mediaURL) {
+                videoURL = mediaURL
+            } else {
+                videoURL = nil
+            }
+
             panel.contentView = OverlayView(
                 image: image,
-                videoURL: mediaURL.flatMap { isVideo($0) ? $0 : nil },
+                videoURL: videoURL,
                 loopVideo: loopVideo,
-                muted: muteVideo
+                muted: muteVideo,
+                backgroundColor: backgroundColor
             )
             panel.setFrame(screen.frame, display: true)
             panel.orderFrontRegardless()
             panels.append(panel)
         }
     }
+
     func restore() {
-        panels.forEach { $0.orderOut(nil); $0.close() }
-        panels.removeAll()
+        panels.forEach {
+            $0.orderOut(nil)
+            $0.close()
+        }
+        panels.removeAll(keepingCapacity: true)
     }
+
     @objc private func screensChanged() {
-        if isActive { blackOnly ? showBlack() : show() }
+        if isActive {
+            if blackOnly { showBlack() }
+            else if colorOnly { showColor(activeColor) }
+            else { show() }
+        }
     }
+
     private func isVideo(_ url: URL) -> Bool {
         UTType(filenameExtension: url.pathExtension)?.conforms(to: .movie) == true
     }
@@ -292,56 +475,87 @@ private final class BlackoutController {
 
 private final class OverlayView: NSView {
     private let image: NSImage?
+    private let backgroundColor: NSColor
     private let player: AVPlayer?
     private let playerLayer: AVPlayerLayer?
     private var endObserver: NSObjectProtocol?
 
-    init(image: NSImage?, videoURL: URL? = nil, loopVideo: Bool = false, muted: Bool = false) {
+    init(image: NSImage?, videoURL: URL? = nil, loopVideo: Bool = false, muted: Bool = false, backgroundColor: NSColor = .black) {
         self.image = image
+        self.backgroundColor = backgroundColor
+
         if let videoURL {
             let player = AVPlayer(url: videoURL)
             player.isMuted = muted
             self.player = player
+
             let layer = AVPlayerLayer(player: player)
             layer.videoGravity = .resizeAspect
-            layer.backgroundColor = NSColor.black.cgColor
+            layer.backgroundColor = backgroundColor.cgColor
             self.playerLayer = layer
+
             super.init(frame: .zero)
             wantsLayer = true
-            self.layer?.backgroundColor = NSColor.black.cgColor
+            self.layer?.backgroundColor = backgroundColor.cgColor
             self.layer?.addSublayer(layer)
-            if loopVideo {
-                endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: player.currentItem, queue: .main) { [weak player] _ in
-                    player?.seek(to: .zero) { _ in player?.play() }
+
+            if loopVideo, let item = player.currentItem {
+                endObserver = NotificationCenter.default.addObserver(
+                    forName: .AVPlayerItemDidPlayToEndTime,
+                    object: item,
+                    queue: .main
+                ) { [weak player] _ in
+                    guard let player else { return }
+                    player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { finished in
+                        guard finished else { return }
+                        player.play()
+                    }
                 }
             }
+
             player.play()
             return
         }
+
         self.player = nil
         self.playerLayer = nil
         super.init(frame: .zero)
         wantsLayer = true
-        layer?.backgroundColor = NSColor.black.cgColor
+        layer?.backgroundColor = backgroundColor.cgColor
     }
+
     deinit {
-        if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
+        if let endObserver {
+            NotificationCenter.default.removeObserver(endObserver)
+        }
         player?.pause()
     }
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
     override func layout() {
         super.layout()
         playerLayer?.frame = bounds
     }
+
     override func draw(_ dirtyRect: NSRect) {
-        NSColor.black.setFill()
+        backgroundColor.setFill()
         bounds.fill()
+
         guard let image else { return }
         let source = image.size
         guard source.width > 0, source.height > 0 else { return }
+
         let scale = min(bounds.width / source.width, bounds.height / source.height)
         let size = NSSize(width: source.width * scale, height: source.height * scale)
-        let rect = NSRect(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2, width: size.width, height: size.height)
+        let rect = NSRect(
+            x: bounds.midX - size.width / 2,
+            y: bounds.midY - size.height / 2,
+            width: size.width,
+            height: size.height
+        )
         image.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1)
     }
 }
@@ -356,6 +570,8 @@ private final class ControlsWindowController: NSWindowController {
     private let interfacePopup = NSPopUpButton()
     private let interfaceStatus = NSTextField(labelWithString: "")
     private let oscStatus = NSTextField(labelWithString: "OSC: Starting…")
+    private let colorWell = NSColorWell()
+    private let colorHexLabel = NSTextField(labelWithString: "#000000")
     private let onBlackout: () -> Void
     private let onBlack: () -> Void
     private let onRestore: () -> Void
@@ -366,6 +582,8 @@ private final class ControlsWindowController: NSWindowController {
     private let onChangeMuteVideo: (Bool) -> Void
     private let onChangePort: (UInt16) -> Void
     private let onChangeInterface: (String) -> Void
+    private let onChangeColor: (NSColor) -> Void
+    private let onApplyColor: () -> Void
 
     init(
         initialPort: UInt16,
@@ -382,7 +600,10 @@ private final class ControlsWindowController: NSWindowController {
         changePort: @escaping (UInt16) -> Void,
         interfaces: [NetworkInterface],
         initialInterface: String,
-        changeInterface: @escaping (String) -> Void
+        changeInterface: @escaping (String) -> Void,
+        initialColor: NSColor,
+        changeColor: @escaping (NSColor) -> Void,
+        applyColor: @escaping () -> Void
     ) {
         onBlackout = blackout
         onBlack = black
@@ -394,8 +615,15 @@ private final class ControlsWindowController: NSWindowController {
         onChangeMuteVideo = changeMuteVideo
         onChangePort = changePort
         onChangeInterface = changeInterface
+        onChangeColor = changeColor
+        onApplyColor = applyColor
 
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 650, height: 680), styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 650, height: 730),
+            styleMask: [.titled, .closable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
         window.title = "BlackoutOSC"
         window.isReleasedWhenClosed = false
         window.center()
@@ -408,28 +636,40 @@ private final class ControlsWindowController: NSWindowController {
         muteVideoButton.state = initialMuteVideo ? .on : .off
         muteVideoButton.target = self
         muteVideoButton.action = #selector(muteVideoChanged)
+        colorWell.color = initialColor
+        colorWell.target = self
+        colorWell.action = #selector(colorChanged)
+        colorHexLabel.stringValue = hexFromColor(initialColor)
+
         interfacePopup.removeAllItems()
         interfacePopup.addItem(withTitle: "All interfaces (0.0.0.0)")
         interfacePopup.lastItem?.representedObject = "any"
+
         for networkInterface in interfaces {
             interfacePopup.addItem(withTitle: networkInterface.label)
             interfacePopup.lastItem?.representedObject = networkInterface.name
         }
+
         selectInterface(initialInterface)
         buildUI()
         setListeningPort(initialPort)
         setListeningInterface(initialInterface)
     }
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
 
     private func buildUI() {
         guard let content = window?.contentView else { return }
+
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 14
         stack.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(stack)
+
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 24),
             stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -24),
@@ -439,6 +679,7 @@ private final class ControlsWindowController: NSWindowController {
         let title = NSTextField(labelWithString: "BlackoutOSC")
         title.font = .systemFont(ofSize: 23, weight: .bold)
         stack.addArrangedSubview(title)
+
         let intro = NSTextField(wrappingLabelWithString: "BlackoutOSC is an OSC-controlled utility, which allows operators to instantly cover screens with custom images or videos when away from Front of House. Use it to display branding, holding graphics, or other visuals while keeping the underlying interface hidden.")
         intro.textColor = .secondaryLabelColor
         intro.maximumNumberOfLines = 12
@@ -456,10 +697,20 @@ private final class ControlsWindowController: NSWindowController {
         mediaRow.addArrangedSubview(button("Choose…", #selector(chooseMedia)))
         mediaRow.addArrangedSubview(button("Clear", #selector(clearMedia)))
         stack.addArrangedSubview(mediaRow)
+
         loopVideoButton.toolTip = "Loop the selected video continuously"
         muteVideoButton.toolTip = "Mute the selected video"
         stack.addArrangedSubview(loopVideoButton)
         stack.addArrangedSubview(muteVideoButton)
+
+        let colorRow = NSStackView()
+        colorRow.orientation = .horizontal
+        colorRow.spacing = 8
+        colorRow.addArrangedSubview(NSTextField(labelWithString: "Custom overlay color:"))
+        colorRow.addArrangedSubview(colorWell)
+        colorRow.addArrangedSubview(colorHexLabel)
+        colorRow.addArrangedSubview(button("Apply Color", #selector(applyColor)))
+        stack.addArrangedSubview(colorRow)
 
         let portRow = NSStackView()
         portRow.orientation = .horizontal
@@ -491,25 +742,38 @@ private final class ControlsWindowController: NSWindowController {
         actionRow.addArrangedSubview(button("Black", #selector(black)))
         actionRow.addArrangedSubview(button("Restore Displays", #selector(restore)))
         stack.addArrangedSubview(actionRow)
+
         oscStatus.font = .systemFont(ofSize: 12, weight: .semibold)
         oscStatus.textColor = .secondaryLabelColor
         stack.addArrangedSubview(oscStatus)
+
         stateLabel.font = .systemFont(ofSize: 13, weight: .semibold)
         stack.addArrangedSubview(stateLabel)
 
         let oscTitle = NSTextField(labelWithString: "OSC commands")
         oscTitle.font = .systemFont(ofSize: 16, weight: .bold)
         stack.addArrangedSubview(oscTitle)
-        let commands = NSTextField(wrappingLabelWithString: "/blackoutosc/start — Screen overlays ON\n/blackoutosc/black — Black out displays, ignoring the overlay media\n/blackoutosc/stop — Screen overlays OFF\n/blackoutosc/setmedia \"/path/to/image-or-video\" — set media\n/blackoutosc/videoloop \"0\"|\"1\" — disable or enable video looping\n/blackoutosc/videomute \"0\"|\"1\" — unmute or mute the selected video\n/blackoutosc/mute \"0\"|\"1\" — alias for videomute")
+
+        let commands = NSTextField(wrappingLabelWithString: "/blackoutosc/start — Screen overlays ON\n/blackoutosc/black — Black out displays, ignoring the overlay media\n/blackoutosc/stop — Screen overlays OFF\n/blackoutosc/setmedia \"/path/to/image-or-video\" — set media\n/blackoutosc/videoloop \"0\"|\"1\" — disable or enable video looping\n/blackoutosc/videomute \"0\"|\"1\" — unmute or mute the selected video\n/blackoutosc/mute \"0\"|\"1\" — alias for videomute\n/blackoutosc/color \"#FFFFFF\" — display a custom solid color (hex RGB)")
         commands.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         commands.textColor = .secondaryLabelColor
         stack.addArrangedSubview(commands)
+
         let footer = NSTextField(labelWithString: "copyright (c) 2026. Kyle Jensen Sound Design. All Rights Reserved")
         footer.font = .systemFont(ofSize: 8)
         footer.textColor = .tertiaryLabelColor
         footer.alignment = .center
         footer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         stack.addArrangedSubview(footer)
+
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "Unknown"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "Unknown"
+        let versionFooter = NSTextField(labelWithString: "Version \(version) • Build \(build)")
+        versionFooter.font = .systemFont(ofSize: 8)
+        versionFooter.textColor = .tertiaryLabelColor
+        versionFooter.alignment = .center
+        versionFooter.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        stack.addArrangedSubview(versionFooter)
     }
 
     private func button(_ title: String, _ action: Selector) -> NSButton {
@@ -517,6 +781,7 @@ private final class ControlsWindowController: NSWindowController {
         button.bezelStyle = .rounded
         return button
     }
+
     func updateMediaPath(_ path: String) {
         mediaPath.stringValue = path
         let url = path.isEmpty ? nil : URL(fileURLWithPath: path)
@@ -524,28 +789,43 @@ private final class ControlsWindowController: NSWindowController {
         loopVideoButton.isEnabled = isVideo
         muteVideoButton.isEnabled = isVideo
     }
+
     func setLoopVideo(_ enabled: Bool) { loopVideoButton.state = enabled ? .on : .off }
     func setMuteVideo(_ enabled: Bool) { muteVideoButton.state = enabled ? .on : .off }
+
+    func setSelectedColor(_ color: NSColor) {
+        colorWell.color = color
+        colorHexLabel.stringValue = hexFromColor(color)
+    }
+
     func setListeningPort(_ port: UInt16) {
         portField.stringValue = String(port)
         portStatus.stringValue = "Listening on UDP \(port)"
     }
+
     func setListeningInterface(_ name: String) {
         selectInterface(name)
         interfaceStatus.stringValue = name == "any" ? "All IPv4 interfaces" : (interfacePopup.selectedItem?.title ?? "")
     }
+
     private func selectInterface(_ name: String) {
-        if let index = interfacePopup.itemArray.firstIndex(where: { ($0.representedObject as? String) == name }) { interfacePopup.selectItem(at: index) }
-        else { interfacePopup.selectItem(at: 0) }
+        if let index = interfacePopup.itemArray.firstIndex(where: { ($0.representedObject as? String) == name }) {
+            interfacePopup.selectItem(at: index)
+        } else {
+            interfacePopup.selectItem(at: 0)
+        }
     }
+
     func setBlackoutActive(_ active: Bool) {
         stateLabel.stringValue = active ? "All connected displays are blacked out" : "Displays are visible"
         stateLabel.textColor = active ? .systemRed : .secondaryLabelColor
     }
+
     func setOSCStatus(_ text: String, isError: Bool = false) {
         oscStatus.stringValue = text
         oscStatus.textColor = isError ? .systemRed : .secondaryLabelColor
     }
+
     @objc private func chooseMedia() { onChooseMedia() }
     @objc private func clearMedia() { onClearMedia() }
     @objc private func loopVideoChanged() { onChangeLoopVideo(loopVideoButton.state == .on) }
@@ -554,6 +834,7 @@ private final class ControlsWindowController: NSWindowController {
     @objc private func black() { onBlack() }
     @objc private func restore() { onRestore() }
     @objc private func toggle() { onToggle() }
+
     @objc private func applyPort() {
         guard let value = UInt16(portField.stringValue), value > 0 else {
             portStatus.stringValue = "Enter a port from 1 to 65535"
@@ -561,8 +842,18 @@ private final class ControlsWindowController: NSWindowController {
         }
         onChangePort(value)
     }
+
     @objc private func interfaceChanged() {
         onChangeInterface(interfacePopup.selectedItem?.representedObject as? String ?? "any")
+    }
+
+    @objc private func colorChanged() {
+        colorHexLabel.stringValue = hexFromColor(colorWell.color)
+        onChangeColor(colorWell.color)
+    }
+
+    @objc private func applyColor() {
+        onApplyColor()
     }
 }
 
@@ -570,23 +861,33 @@ private struct NetworkInterface {
     let name: String
     let address: String
     let label: String
+
     static func available() -> [NetworkInterface] {
         var result: [NetworkInterface] = []
         var first: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&first) == 0 else { return result }
         defer { freeifaddrs(first) }
+
         var current = first
         while let entry = current?.pointee {
             defer { current = entry.ifa_next }
-            guard let address = entry.ifa_addr, address.pointee.sa_family == UInt8(AF_INET), (entry.ifa_flags & UInt32(IFF_UP)) != 0, (entry.ifa_flags & UInt32(IFF_RUNNING)) != 0 else { continue }
+
+            guard let address = entry.ifa_addr,
+                  address.pointee.sa_family == UInt8(AF_INET),
+                  (entry.ifa_flags & UInt32(IFF_UP)) != 0,
+                  (entry.ifa_flags & UInt32(IFF_RUNNING)) != 0 else { continue }
+
             let name = String(cString: entry.ifa_name)
             var ipv4 = address.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr }
             var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+
             guard inet_ntop(AF_INET, &ipv4, &buffer, socklen_t(INET_ADDRSTRLEN)) != nil else { continue }
             let ip = String(cString: buffer)
             guard !result.contains(where: { $0.name == name }) else { continue }
+
             result.append(NetworkInterface(name: name, address: ip, label: "\(name) — \(ip)"))
         }
+
         return result.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 }
@@ -604,88 +905,191 @@ private final class OSCServer {
     private var socket: Int32 = -1
     private var running = false
     private var generation = 0
+
     var onCommand: ((OSCCommand) -> Void)?
     var onStatus: ((OSCServerStatus) -> Void)?
-    enum OSCServerStatus { case listening(UInt16, String); case stopped; case error(String) }
-    init(port: UInt16, bindAddress: String? = nil) { self.port = port; self.bindAddress = bindAddress }
+
+    enum OSCServerStatus {
+        case listening(UInt16, String)
+        case stopped
+        case error(String)
+    }
+
+    init(port: UInt16, bindAddress: String? = nil) {
+        self.port = port
+        self.bindAddress = bindAddress
+    }
 
     func start() {
         stop()
+
         let fd = Darwin.socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
-        guard fd >= 0 else { let message = "Could not create UDP socket: \(String(cString: strerror(errno)))"; NSLog("BlackoutOSC: \(message)"); onStatus?(.error(message)); return }
+        guard fd >= 0 else {
+            let message = "Could not create UDP socket: \(String(cString: strerror(errno)))"
+            NSLog("BlackoutOSC: %@", message)
+            onStatus?(.error(message))
+            return
+        }
+
         var reuse: Int32 = 1
         _ = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+
         var address = sockaddr_in()
         address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         address.sin_family = sa_family_t(AF_INET)
         address.sin_port = port.bigEndian
+
         if let bindAddress {
             var selectedAddress = in_addr()
-            guard bindAddress.withCString({ inet_pton(AF_INET, $0, &selectedAddress) }) == 1 else { let message = "Invalid IPv4 interface address: \(bindAddress)"; Darwin.close(fd); onStatus?(.error(message)); return }
+            guard bindAddress.withCString({ inet_pton(AF_INET, $0, &selectedAddress) }) == 1 else {
+                let message = "Invalid IPv4 interface address: \(bindAddress)"
+                _ = Darwin.close(fd)
+                onStatus?(.error(message))
+                return
+            }
             address.sin_addr = selectedAddress
-        } else { address.sin_addr = in_addr(s_addr: INADDR_ANY) }
-        let bindResult = withUnsafePointer(to: &address) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
-        guard bindResult == 0 else { let message = "Could not bind UDP port \(port): \(String(cString: strerror(errno)))"; NSLog("BlackoutOSC: \(message)"); Darwin.close(fd); onStatus?(.error(message)); return }
-        stateLock.lock(); generation += 1; let token = generation; socket = fd; running = true; stateLock.unlock()
-        let interfaceLabel = bindAddress ?? "0.0.0.0"
-        onStatus?(.listening(port, interfaceLabel))
-        receiveQueue.async { [weak self] in self?.receiveLoop(socket: fd, token: token) }
+        } else {
+            address.sin_addr = in_addr(s_addr: INADDR_ANY)
+        }
+
+        let bindResult = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+
+        guard bindResult == 0 else {
+            let message = "Could not bind UDP port \(port): \(String(cString: strerror(errno)))"
+            NSLog("BlackoutOSC: %@", message)
+            _ = Darwin.close(fd)
+            onStatus?(.error(message))
+            return
+        }
+
+        stateLock.lock()
+        generation += 1
+        let token = generation
+        socket = fd
+        running = true
+        stateLock.unlock()
+
+        onStatus?(.listening(port, bindAddress ?? "0.0.0.0"))
+        receiveQueue.async { [weak self] in
+            self?.receiveLoop(socket: fd, token: token)
+        }
     }
+
     func stop() {
-        stateLock.lock(); generation += 1; running = false; let fd = socket; socket = -1; stateLock.unlock()
-        if fd >= 0 { Darwin.shutdown(fd, SHUT_RDWR); Darwin.close(fd) }
-        onStatus?(.stopped)
+        stateLock.lock()
+        generation += 1
+        let wasRunning = running
+        running = false
+        let fd = socket
+        socket = -1
+        stateLock.unlock()
+
+        if fd >= 0 {
+            _ = Darwin.shutdown(fd, SHUT_RDWR)
+            _ = Darwin.close(fd)
+        }
+
+        if wasRunning {
+            onStatus?(.stopped)
+        }
     }
-    private func isRunning(token: Int) -> Bool { stateLock.lock(); defer { stateLock.unlock() }; return running && generation == token }
+
+    private func isRunning(token: Int) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return running && generation == token
+    }
+
     private func receiveLoop(socket: Int32, token: Int) {
-        var buffer = [UInt8](repeating: 0, count: 65_535)
+        var buffer = [UInt8](repeating: 0, count: Int(UInt16.max))
+
         while isRunning(token: token) {
             var sender = sockaddr_storage()
             var senderLength = socklen_t(MemoryLayout<sockaddr_storage>.size)
-            let count = buffer.withUnsafeMutableBytes { bytes in withUnsafeMutablePointer(to: &sender) { senderPtr in senderPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.recvfrom(socket, bytes.baseAddress, bytes.count, 0, $0, &senderLength) } } }
+
+            let count: Int = buffer.withUnsafeMutableBytes {
+                (bytes: UnsafeMutableRawBufferPointer) -> Int in
+                guard let baseAddress = bytes.baseAddress else { return -1 }
+                return withUnsafeMutablePointer(to: &sender) { senderPtr in
+                    senderPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { addressPtr in
+                        Int(Darwin.recvfrom(socket, baseAddress, bytes.count, 0, addressPtr, &senderLength))
+                    }
+                }
+            }
             if count > 0 {
-                let data = Data(buffer[0..<Int(count)])
-                for command in Self.parseMessages(data) { onCommand?(command) }
+                let data = Data(buffer.prefix(count))
+                for command in Self.parseMessages(data) {
+                    onCommand?(command)
+                }
             } else if count < 0 {
                 let error = errno
-                if error != EBADF && error != EINTR && error != ECONNRESET && isRunning(token: token) { NSLog("BlackoutOSC: recvfrom error: %s", strerror(error)) }
+                if error != EBADF && error != EINTR && error != ECONNRESET && isRunning(token: token) {
+                    NSLog("BlackoutOSC: recvfrom error: %s", strerror(error))
+                }
             }
         }
     }
+
     private static func parseMessages(_ data: Data) -> [OSCCommand] {
         guard !data.isEmpty else { return [] }
-        if string(at: 0, in: data) == "#bundle" { return parseBundle(data) }
+        if string(at: 0, in: data) == "#bundle" {
+            return parseBundle(data)
+        }
         return parseMessage(data).map { [$0] } ?? []
     }
+
     private static func parseBundle(_ data: Data) -> [OSCCommand] {
-        guard data.count >= 16 else { return [] }
+        guard data.count >= 16, string(at: 0, in: data) == "#bundle" else { return [] }
+
         var offset = 16
         var commands: [OSCCommand] = []
+
         while offset + 4 <= data.count {
             let length = data[offset..<(offset + 4)].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
             offset += 4
+
+            guard length > 0,
+                  length <= UInt32(data.count - offset) else { break }
+
             let end = offset + Int(length)
-            guard length > 0, end <= data.count else { break }
             commands += parseMessages(data.subdata(in: offset..<end))
             offset = end
         }
+
         return commands
     }
+
     private static func parseMessage(_ data: Data) -> OSCCommand? {
         guard let address = string(at: 0, in: data), address.hasPrefix("/") else { return nil }
+
         let typeOffset = paddedLength(at: 0, in: data)
-        guard typeOffset < data.count, let tags = string(at: typeOffset, in: data) else { return OSCCommand(address: address, firstString: nil) }
-        if tags.hasPrefix(",s") { return OSCCommand(address: address, firstString: string(at: typeOffset + paddedLength(at: typeOffset, in: data), in: data)) }
-        return OSCCommand(address: address, firstString: nil)
+        guard typeOffset < data.count,
+              let tags = string(at: typeOffset, in: data),
+              tags.first == "," else {
+            return OSCCommand(address: address, firstString: nil)
+        }
+
+        guard tags.hasPrefix(",s") else {
+            return OSCCommand(address: address, firstString: nil)
+        }
+
+        let valueOffset = typeOffset + paddedLength(at: typeOffset, in: data)
+        return OSCCommand(address: address, firstString: string(at: valueOffset, in: data))
     }
+
     private static func string(at offset: Int, in data: Data) -> String? {
-        guard offset < data.count else { return nil }
+        guard offset >= 0, offset < data.count else { return nil }
         let bytes = data[offset...]
         guard let end = bytes.firstIndex(of: 0) else { return nil }
         return String(data: data[offset..<end], encoding: .utf8)
     }
+
     private static func paddedLength(at offset: Int, in data: Data) -> Int {
-        guard offset < data.count else { return 0 }
+        guard offset >= 0, offset < data.count else { return 0 }
         let count = data[offset...].prefix { $0 != 0 }.count + 1
         return ((count + 3) / 4) * 4
     }
@@ -694,12 +1098,20 @@ private final class OSCServer {
 private final class GlobalInputMonitor {
     static let shared = GlobalInputMonitor()
     private var monitor: Any?
+
     func start(onInput: @escaping () -> Void) {
         stop()
-        monitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown]) { _ in onInput() }
+        monitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown]
+        ) { _ in
+            onInput()
+        }
     }
+
     func stop() {
-        if let monitor { NSEvent.removeMonitor(monitor) }
+        if let monitor {
+            NSEvent.removeMonitor(monitor)
+        }
         monitor = nil
     }
 }
